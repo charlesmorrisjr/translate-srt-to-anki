@@ -326,7 +326,7 @@ def _extract_youtube_id(url: str) -> Optional[str]:
 
 
 def _sanitize_title_for_filename(title: str) -> str:
-    """Replace filesystem-problematic characters (/:*?"<>|\) with hyphens and normalize dashes."""
+    """Replace filesystem-problematic characters with hyphens and normalize dashes."""
     # Normalize Unicode to fold full-width punctuation, etc.
     s = unicodedata.normalize('NFKC', title)
     # Normalize various dash-like characters to ASCII hyphen
