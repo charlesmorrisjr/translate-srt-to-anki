@@ -143,18 +143,21 @@ def should_filter_subtitle_text(text: str) -> bool:
 
 
 def srt_to_anki_csv(input_path: str, output_path: str, video_path: Optional[str] = None, media_dir: Optional[str] = None):
-    # Read SRT file
+    print(f"Reading SRT: {input_path}")
     with open(input_path, "r", encoding="utf-8") as f:
         lines = f.read().splitlines()
 
-    # Parse SRT blocks with timing and merged text per block
+    print("Parsing subtitles ...")
     blocks = parse_srt_with_timing(lines)
+    print(f"Parsed {len(blocks)} blocks")
 
-    # Remove trivial interjections and name-only lines
+    before_filter = len(blocks)
     blocks = [b for b in blocks if not should_filter_subtitle_text(b[3])]
+    removed_filter = before_filter - len(blocks)
+    print(f"Filtering trivial/name-only lines: kept {len(blocks)} (removed {removed_filter})")
 
-    # Remove duplicates only when not generating images (to keep image mapping stable)
     if video_path is None:
+        print("Removing duplicate subtitle texts ...")
         seen_texts = set()
         filtered_blocks = []
         for idx, start_s, end_s, text in blocks:
@@ -162,7 +165,9 @@ def srt_to_anki_csv(input_path: str, output_path: str, video_path: Optional[str]
                 continue
             seen_texts.add(text)
             filtered_blocks.append((idx, start_s, end_s, text))
+        dup_removed = len(blocks) - len(filtered_blocks)
         blocks = filtered_blocks
+        print(f"Deduped: kept {len(blocks)} (removed {dup_removed})")
 
     # Translate (lazy import so -h works without deep-translator installed)
     try:
@@ -171,15 +176,19 @@ def srt_to_anki_csv(input_path: str, output_path: str, video_path: Optional[str]
         raise SystemExit("Missing dependency: deep-translator. Install with: pip install deep-translator") from e
     translator = GoogleTranslator(source="es", target="en")
 
-    # Determine media directory and filename base if video provided
     output_csv_path = Path(output_path)
     if video_path:
         media_root = Path(media_dir) if media_dir else output_csv_path.with_suffix("").parent / "images"
-        # If user gave a directory path for output CSV (e.g., ./out/file.csv), ensure media folder is next to CSV
         if not media_dir:
             media_root = output_csv_path.parent / "images"
         media_root.mkdir(parents=True, exist_ok=True)
-        image_rel_prefix = media_root.name  # Use relative folder name in CSV
+        image_rel_prefix = media_root.name
+
+    total = len(blocks)
+    if video_path:
+        print(f"Translating and extracting screenshots for {total} subtitles ...")
+    else:
+        print(f"Translating {total} subtitles ...")
 
     rows: List[List[str]] = []
     for i, (idx, start_s, end_s, es_text) in enumerate(blocks, start=1):
@@ -189,13 +198,18 @@ def srt_to_anki_csv(input_path: str, output_path: str, video_path: Optional[str]
             image_name = f"{Path(input_path).stem}-{i:04d}.jpg"
             image_path = media_root / image_name
             extract_screenshot(video_path, midpoint, image_path)
-            # image_field = f"<img src='{image_rel_prefix}/{image_name}'>"
             image_field = f"<img src='{image_name}'>"
             rows.append([es_text, en_text, image_field])
         else:
             rows.append([es_text, en_text])
+        if i == total or i % 25 == 0:
+            sys.stdout.write(f"\r  progress: {i}/{total}")
+            sys.stdout.flush()
+    if total:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
-    # Write CSV
+    print(f"Writing CSV to {output_path} ...")
     with open(output_path, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
         if video_path:
@@ -215,7 +229,6 @@ def _choose_best_srt_file(candidates: List[Path]) -> Optional[Path]:
         return 0 if re.search(r"\.es([\._\-].*)?\.srt$", name) else 1
     def is_auto(p: Path) -> int:
         return 1 if "auto" in p.name.lower() else 0
-    # Prefer Spanish code, then non-auto, then newest
     sorted_candidates = sorted(
         candidates,
         key=lambda p: (lang_score(p), is_auto(p), -p.stat().st_mtime)
@@ -224,6 +237,7 @@ def _choose_best_srt_file(candidates: List[Path]) -> Optional[Path]:
 
 
 def download_subtitles_with_yt_dlp(url: str, out_dir: Path, sub_langs: str = "es,es-ES,es-419") -> Path:
+    print(f"[yt-dlp] Downloading subtitles ({sub_langs}) to {out_dir} ...")
     out_dir.mkdir(parents=True, exist_ok=True)
     out_tmpl = str(out_dir / "%(id)s.%(ext)s")
     cmd = [
@@ -247,10 +261,12 @@ def download_subtitles_with_yt_dlp(url: str, out_dir: Path, sub_langs: str = "es
     best = _choose_best_srt_file(srt_files)
     if not best:
         raise RuntimeError("No .srt subtitles were downloaded by yt-dlp. Check language availability with --list-subs.")
+    print(f"[yt-dlp] Found subtitles: {best}")
     return best
 
 
 def download_video_with_yt_dlp(url: str, out_dir: Path) -> Path:
+    print(f"[yt-dlp] Downloading video to {out_dir} ...")
     out_dir.mkdir(parents=True, exist_ok=True)
     out_tmpl = str(out_dir / "%(id)s.%(ext)s")
     cmd = [
@@ -266,15 +282,14 @@ def download_video_with_yt_dlp(url: str, out_dir: Path) -> Path:
         raise RuntimeError("yt-dlp not found. Please install yt-dlp and try again.")
     except subprocess.CalledProcessError as e:
         raise RuntimeError("yt-dlp failed while downloading the video") from e
-    # Prefer mp4, then mkv, webm, mov
     preferred_exts = ["*.mp4", "*.mkv", "*.webm", "*.mov"]
     candidates: List[Path] = []
     for pattern in preferred_exts:
         candidates.extend(out_dir.glob(pattern))
     if not candidates:
         raise RuntimeError("Video download completed but no output video file was found.")
-    # Choose the newest matching
     chosen = sorted(candidates, key=lambda p: -p.stat().st_mtime)[0]
+    print(f"[yt-dlp] Video saved: {chosen}")
     return chosen
 
 
@@ -288,7 +303,6 @@ if __name__ == "__main__":
     parser.add_argument("output", nargs="?", help="Path to output .csv file. Defaults to input name with .csv extension")
     parser.add_argument("--video", dest="video", help="Path to the corresponding video file for taking screenshots")
     parser.add_argument("--media-dir", dest="media_dir", help="Directory to save images (default: images next to CSV)")
-    # yt-dlp integration
     parser.add_argument("--yt-url", dest="yt_url", help="Video URL to download Spanish subtitles via yt-dlp (and optionally the video)")
     parser.add_argument("--yt-sub-langs", dest="yt_sub_langs", default="es,es-ES,es-419", help="Comma-separated subtitle language codes to request (default: es,es-ES,es-419)")
     parser.add_argument("--lang", dest="single_lang", help="Single subtitle language code (alias for --yt-sub-langs)")
@@ -300,17 +314,14 @@ if __name__ == "__main__":
     input_path: Optional[str] = args.input
     output_path: Optional[str] = args.output
 
-    # If the first positional input looks like a URL, treat it as --yt-url
     if input_path and _is_url(input_path):
         args.yt_url = input_path
         input_path = None
 
     temp_dir_obj = None
     try:
-        # If a yt URL is provided and no input SRT, fetch subtitles (and maybe video)
         if args.yt_url and not input_path:
             from tempfile import TemporaryDirectory
-            # Decide download directory: explicit --yt-out-dir, else output CSV's directory if provided, else temp
             if args.yt_out_dir:
                 yt_out_dir = Path(args.yt_out_dir)
                 temp_dir_obj = None
@@ -323,11 +334,9 @@ if __name__ == "__main__":
             sub_langs = args.single_lang or args.yt_sub_langs
             srt_path = download_subtitles_with_yt_dlp(args.yt_url, yt_out_dir, sub_langs=sub_langs)
             input_path = str(srt_path)
-            # Default output in the current working directory if not given
             if not output_path:
                 output_stem = Path(input_path).stem
                 output_path = str(Path.cwd() / f"{output_stem}.csv")
-            # Download video only if requested and not already given
             if args.yt_download_video and not args.video:
                 video_file = download_video_with_yt_dlp(args.yt_url, yt_out_dir)
                 args.video = str(video_file)
