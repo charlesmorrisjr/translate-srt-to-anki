@@ -16,6 +16,7 @@ import re
 import csv
 import argparse
 import subprocess
+import unicodedata
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -142,7 +143,7 @@ def should_filter_subtitle_text(text: str) -> bool:
     return False
 
 
-def srt_to_anki_csv(input_path: str, output_path: str, video_path: Optional[str] = None, media_dir: Optional[str] = None):
+def srt_to_anki_csv(input_path: str, output_path: str, video_path: Optional[str] = None, media_dir: Optional[str] = None, image_name_prefix: Optional[str] = None):
     print(f"Reading SRT: {input_path}")
     with open(input_path, "r", encoding="utf-8") as f:
         lines = f.read().splitlines()
@@ -191,11 +192,12 @@ def srt_to_anki_csv(input_path: str, output_path: str, video_path: Optional[str]
         print(f"Translating {total} subtitles ...")
 
     rows: List[List[str]] = []
+    prefix = image_name_prefix or Path(input_path).stem
     for i, (idx, start_s, end_s, es_text) in enumerate(blocks, start=1):
         en_text = translator.translate(es_text)
         if video_path:
             midpoint = start_s + max(0.0, (end_s - start_s)) / 2.0
-            image_name = f"{Path(input_path).stem}-{i:04d}.jpg"
+            image_name = f"{prefix}-{i:04d}.jpg"
             image_path = media_root / image_name
             extract_screenshot(video_path, midpoint, image_path)
             image_field = f"<img src='{image_name}'>"
@@ -239,7 +241,7 @@ def _choose_best_srt_file(candidates: List[Path]) -> Optional[Path]:
 def download_subtitles_with_yt_dlp(url: str, out_dir: Path, sub_langs: str = "es,es-ES,es-419") -> Path:
     print(f"[yt-dlp] Downloading subtitles ({sub_langs}) to {out_dir} ...")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_tmpl = str(out_dir / "%(id)s.%(ext)s")
+    out_tmpl = str(out_dir / "%(title)s.%(ext)s")
     cmd = [
         "yt-dlp",
         "--skip-download",
@@ -248,6 +250,7 @@ def download_subtitles_with_yt_dlp(url: str, out_dir: Path, sub_langs: str = "es
         "--sub-langs", sub_langs,
         "--sub-format", "srt",
         "--convert-subs", "srt",
+        "--windows-filenames",
         "-o", out_tmpl,
         url,
     ]
@@ -268,11 +271,12 @@ def download_subtitles_with_yt_dlp(url: str, out_dir: Path, sub_langs: str = "es
 def download_video_with_yt_dlp(url: str, out_dir: Path) -> Path:
     print(f"[yt-dlp] Downloading video to {out_dir} ...")
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_tmpl = str(out_dir / "%(id)s.%(ext)s")
+    out_tmpl = str(out_dir / "%(title)s.%(ext)s")
     cmd = [
         "yt-dlp",
         "-f", "bv*+ba/b",
         "--merge-output-format", "mp4",
+        "--windows-filenames",
         "-o", out_tmpl,
         url,
     ]
@@ -297,12 +301,54 @@ def _is_url(value: str) -> bool:
     return value.startswith("http://") or value.startswith("https://")
 
 
+def _derive_title_from_srt_filename(srt_path: Path) -> str:
+    """Return a clean title from an SRT filename like 'Title.es.srt' -> 'Title'."""
+    stem = srt_path.stem  # e.g., 'My Video.es'
+    m = re.match(r"^(?P<title>.+?)\.(?P<lang>[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,4})?)$", stem)
+    if m:
+        return m.group("title")
+    return stem
+
+
+def _extract_youtube_id(url: str) -> Optional[str]:
+    """Attempt to extract the 11-char YouTube video ID from common URL forms."""
+    patterns = [
+        r"[?&]v=([A-Za-z0-9_-]{11})",
+        r"youtu\.be/([A-Za-z0-9_-]{11})",
+        r"/shorts/([A-Za-z0-9_-]{11})",
+        r"/embed/([A-Za-z0-9_-]{11})",
+    ]
+    for pat in patterns:
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _sanitize_title_for_filename(title: str) -> str:
+    """Replace filesystem-problematic characters (/:*?"<>|\) with hyphens and normalize dashes."""
+    # Normalize Unicode to fold full-width punctuation, etc.
+    s = unicodedata.normalize('NFKC', title)
+    # Normalize various dash-like characters to ASCII hyphen
+    s = re.sub(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212\uFE58\uFE63\uFF0D]", "-", s)
+    # Replace forbidden characters with '-'
+    s = re.sub(r"[\\/:*?\"<>|]", "-", s)
+    # Collapse multiple spaces
+    s = re.sub(r"\s+", " ", s).strip()
+    # Collapse multiple hyphens
+    s = re.sub(r"-+", "-", s)
+    # Avoid names ending with a dot or space
+    s = s.rstrip(" .")
+    return s
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert a Spanish SRT subtitle file to an Anki-ready CSV, optionally with screenshots from a matching video.")
     parser.add_argument("input", nargs="?", help="Path to input .srt file or a YouTube URL")
     parser.add_argument("output", nargs="?", help="Path to output .csv file. Defaults to input name with .csv extension")
     parser.add_argument("--video", dest="video", help="Path to the corresponding video file for taking screenshots")
     parser.add_argument("--media-dir", dest="media_dir", help="Directory to save images (default: images next to CSV)")
+    # yt-dlp integration
     parser.add_argument("--yt-url", dest="yt_url", help="Video URL to download Spanish subtitles via yt-dlp (and optionally the video)")
     parser.add_argument("--yt-sub-langs", dest="yt_sub_langs", default="es,es-ES,es-419", help="Comma-separated subtitle language codes to request (default: es,es-ES,es-419)")
     parser.add_argument("--lang", dest="single_lang", help="Single subtitle language code (alias for --yt-sub-langs)")
@@ -314,14 +360,17 @@ if __name__ == "__main__":
     input_path: Optional[str] = args.input
     output_path: Optional[str] = args.output
 
+    # If the first positional input looks like a URL, treat it as --yt-url
     if input_path and _is_url(input_path):
         args.yt_url = input_path
         input_path = None
 
     temp_dir_obj = None
     try:
+        # If a yt URL is provided and no input SRT, fetch subtitles (and maybe video)
         if args.yt_url and not input_path:
             from tempfile import TemporaryDirectory
+            # Decide download directory: explicit --yt-out-dir, else output CSV's directory if provided, else temp
             if args.yt_out_dir:
                 yt_out_dir = Path(args.yt_out_dir)
                 temp_dir_obj = None
@@ -334,9 +383,16 @@ if __name__ == "__main__":
             sub_langs = args.single_lang or args.yt_sub_langs
             srt_path = download_subtitles_with_yt_dlp(args.yt_url, yt_out_dir, sub_langs=sub_langs)
             input_path = str(srt_path)
+
+            # Derive a safe base title and append the video ID
+            raw_title = _derive_title_from_srt_filename(Path(input_path))
+            video_id = _extract_youtube_id(args.yt_url)
+            base_title = f"{raw_title} [{video_id}]" if video_id else raw_title
+
+            # Default output in the current working directory if not given
             if not output_path:
-                output_stem = Path(input_path).stem
-                output_path = str(Path.cwd() / f"{output_stem}.csv")
+                output_path = str(Path.cwd() / f"{base_title}.csv")
+            # Download video only if requested and not already given
             if args.yt_download_video and not args.video:
                 video_file = download_video_with_yt_dlp(args.yt_url, yt_out_dir)
                 args.video = str(video_file)
@@ -346,7 +402,14 @@ if __name__ == "__main__":
 
         final_output_path = output_path or str(Path(input_path).with_suffix(".csv"))
 
-        srt_to_anki_csv(input_path, final_output_path, video_path=args.video, media_dir=args.media_dir)
+        # Decide image prefix: prefer derived safe title + [id] when URL flow is used
+        image_prefix = None
+        if args.yt_url:
+            raw_title = _derive_title_from_srt_filename(Path(input_path))
+            video_id = _extract_youtube_id(args.yt_url)
+            image_prefix = f"{raw_title} [{video_id}]" if video_id else raw_title
+
+        srt_to_anki_csv(input_path, final_output_path, video_path=args.video, media_dir=args.media_dir, image_name_prefix=image_prefix)
     finally:
         if temp_dir_obj is not None:
             temp_dir_obj.cleanup()
