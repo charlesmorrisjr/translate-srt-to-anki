@@ -18,7 +18,6 @@ import argparse
 import subprocess
 from pathlib import Path
 from typing import List, Optional, Tuple
-from deep_translator import GoogleTranslator
 
 
 def parse_timestamp_to_seconds(timestamp: str) -> float:
@@ -165,7 +164,11 @@ def srt_to_anki_csv(input_path: str, output_path: str, video_path: Optional[str]
             filtered_blocks.append((idx, start_s, end_s, text))
         blocks = filtered_blocks
 
-    # Translate
+    # Translate (lazy import so -h works without deep-translator installed)
+    try:
+        from deep_translator import GoogleTranslator
+    except ModuleNotFoundError as e:
+        raise SystemExit("Missing dependency: deep-translator. Install with: pip install deep-translator") from e
     translator = GoogleTranslator(source="es", target="en")
 
     # Determine media directory and filename base if video provided
@@ -204,16 +207,137 @@ def srt_to_anki_csv(input_path: str, output_path: str, video_path: Optional[str]
     print(f"CSV saved to {output_path}")
 
 
+def _choose_best_srt_file(candidates: List[Path]) -> Optional[Path]:
+    if not candidates:
+        return None
+    def lang_score(p: Path) -> int:
+        name = p.name
+        return 0 if re.search(r"\.es([\._\-].*)?\.srt$", name) else 1
+    def is_auto(p: Path) -> int:
+        return 1 if "auto" in p.name.lower() else 0
+    # Prefer Spanish code, then non-auto, then newest
+    sorted_candidates = sorted(
+        candidates,
+        key=lambda p: (lang_score(p), is_auto(p), -p.stat().st_mtime)
+    )
+    return sorted_candidates[0]
+
+
+def download_subtitles_with_yt_dlp(url: str, out_dir: Path, sub_langs: str = "es,es-ES,es-419") -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_tmpl = str(out_dir / "%(id)s.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "--skip-download",
+        "--write-subs",
+        "--write-auto-subs",
+        "--sub-langs", sub_langs,
+        "--sub-format", "srt",
+        "--convert-subs", "srt",
+        "-o", out_tmpl,
+        url,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise RuntimeError("yt-dlp not found. Please install yt-dlp and try again.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError("yt-dlp failed while downloading subtitles") from e
+    srt_files = list(out_dir.glob("*.srt"))
+    best = _choose_best_srt_file(srt_files)
+    if not best:
+        raise RuntimeError("No .srt subtitles were downloaded by yt-dlp. Check language availability with --list-subs.")
+    return best
+
+
+def download_video_with_yt_dlp(url: str, out_dir: Path) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_tmpl = str(out_dir / "%(id)s.%(ext)s")
+    cmd = [
+        "yt-dlp",
+        "-f", "bv*+ba/b",
+        "--merge-output-format", "mp4",
+        "-o", out_tmpl,
+        url,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise RuntimeError("yt-dlp not found. Please install yt-dlp and try again.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError("yt-dlp failed while downloading the video") from e
+    # Prefer mp4, then mkv, webm, mov
+    preferred_exts = ["*.mp4", "*.mkv", "*.webm", "*.mov"]
+    candidates: List[Path] = []
+    for pattern in preferred_exts:
+        candidates.extend(out_dir.glob(pattern))
+    if not candidates:
+        raise RuntimeError("Video download completed but no output video file was found.")
+    # Choose the newest matching
+    chosen = sorted(candidates, key=lambda p: -p.stat().st_mtime)[0]
+    return chosen
+
+
+def _is_url(value: str) -> bool:
+    return value.startswith("http://") or value.startswith("https://")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert a Spanish SRT subtitle file to an Anki-ready CSV, optionally with screenshots from a matching video.")
-    parser.add_argument("input", help="Path to input .srt file")
+    parser.add_argument("input", nargs="?", help="Path to input .srt file or a YouTube URL")
     parser.add_argument("output", nargs="?", help="Path to output .csv file. Defaults to input name with .csv extension")
     parser.add_argument("--video", dest="video", help="Path to the corresponding video file for taking screenshots")
     parser.add_argument("--media-dir", dest="media_dir", help="Directory to save images (default: images next to CSV)")
+    # yt-dlp integration
+    parser.add_argument("--yt-url", dest="yt_url", help="Video URL to download Spanish subtitles via yt-dlp (and optionally the video)")
+    parser.add_argument("--yt-sub-langs", dest="yt_sub_langs", default="es,es-ES,es-419", help="Comma-separated subtitle language codes to request (default: es,es-ES,es-419)")
+    parser.add_argument("--lang", dest="single_lang", help="Single subtitle language code (alias for --yt-sub-langs)")
+    parser.add_argument("--yt-out-dir", dest="yt_out_dir", help="Directory to place yt-dlp downloads (default: temporary directory)")
+    parser.add_argument("--yt-download-video", dest="yt_download_video", action="store_true", help="Also download the video via yt-dlp for --video screenshots if --video not provided")
 
     args = parser.parse_args()
 
-    input_path = args.input
-    output_path = args.output or str(Path(input_path).with_suffix(".csv"))
+    input_path: Optional[str] = args.input
+    output_path: Optional[str] = args.output
 
-    srt_to_anki_csv(input_path, output_path, video_path=args.video, media_dir=args.media_dir)
+    # If the first positional input looks like a URL, treat it as --yt-url
+    if input_path and _is_url(input_path):
+        args.yt_url = input_path
+        input_path = None
+
+    temp_dir_obj = None
+    try:
+        # If a yt URL is provided and no input SRT, fetch subtitles (and maybe video)
+        if args.yt_url and not input_path:
+            from tempfile import TemporaryDirectory
+            # Decide download directory: explicit --yt-out-dir, else output CSV's directory if provided, else temp
+            if args.yt_out_dir:
+                yt_out_dir = Path(args.yt_out_dir)
+                temp_dir_obj = None
+            elif output_path:
+                yt_out_dir = Path(output_path).parent
+                temp_dir_obj = None
+            else:
+                temp_dir_obj = TemporaryDirectory()
+                yt_out_dir = Path(temp_dir_obj.name)
+            sub_langs = args.single_lang or args.yt_sub_langs
+            srt_path = download_subtitles_with_yt_dlp(args.yt_url, yt_out_dir, sub_langs=sub_langs)
+            input_path = str(srt_path)
+            # Default output in the current working directory if not given
+            if not output_path:
+                output_stem = Path(input_path).stem
+                output_path = str(Path.cwd() / f"{output_stem}.csv")
+            # Download video only if requested and not already given
+            if args.yt_download_video and not args.video:
+                video_file = download_video_with_yt_dlp(args.yt_url, yt_out_dir)
+                args.video = str(video_file)
+
+        if not input_path:
+            raise SystemExit("You must provide an input .srt file or a URL.")
+
+        final_output_path = output_path or str(Path(input_path).with_suffix(".csv"))
+
+        srt_to_anki_csv(input_path, final_output_path, video_path=args.video, media_dir=args.media_dir)
+    finally:
+        if temp_dir_obj is not None:
+            temp_dir_obj.cleanup()

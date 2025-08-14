@@ -13,6 +13,7 @@ Convert a Spanish `.srt` subtitle file into an Anki‑ready CSV. Optionally, tak
 - **Python**: 3.8+
 - **Packages**: `deep-translator`
 - **Optional**: `ffmpeg` (required only for `--video` screenshots)
+- **Optional**: `yt-dlp` (only if using `--yt-url` integration)
 
 Install Python dependency:
 ```bash
@@ -24,8 +25,13 @@ Install `ffmpeg` (if using `--video`):
 - macOS (Homebrew): `brew install ffmpeg`
 - Arch: `sudo pacman -S ffmpeg`
 
+Install `yt-dlp` (if using `--yt-url`):
+```bash
+pip install yt-dlp
+```
+
 ## Usage
-Basic:
+Basic (local `.srt`):
 ```bash
 python translate-srt-to-anki.py input.srt [output.csv]
 ```
@@ -33,10 +39,35 @@ With screenshots from a matching video and optional media directory:
 ```bash
 python translate-srt-to-anki.py input.srt [output.csv] --video /path/to/video.mp4 [--media-dir images]
 ```
+From a YouTube URL (downloads subs automatically):
+```bash
+python translate-srt-to-anki.py "VIDEO_URL"
+```
+Specify subtitle language (alias for `--yt-sub-langs`):
+```bash
+python translate-srt-to-anki.py "VIDEO_URL" --lang es-ES
+```
+Also download the video and take screenshots:
+```bash
+python translate-srt-to-anki.py "VIDEO_URL" --lang es --yt-download-video --media-dir images
+```
+Choose where downloads go (defaults to output CSV folder if provided, otherwise a temp dir):
+```bash
+python translate-srt-to-anki.py "VIDEO_URL" out/movie.csv --yt-out-dir /path/to/downloads
+```
 Show help:
 ```bash
 python translate-srt-to-anki.py -h
 ```
+
+### Using yt-dlp from this tool (optional)
+You can let the script call `yt-dlp` to fetch Spanish subtitles (and optionally the video) directly from a URL.
+
+Notes:
+- When a URL is the first argument, it is treated the same as `--yt-url URL`.
+- If you omit `output.csv`, the CSV is written to the current working directory, named after the downloaded `.srt`.
+- If `--yt-download-video` is set and `--video` is not provided, the downloaded video will be used for screenshots.
+- Ensure `yt-dlp` is installed and on your `PATH`.
 
 ### Behavior and outputs
 - If `output.csv` is omitted, it will be written next to `input.srt` with the same name and a `.csv` extension.
@@ -44,27 +75,9 @@ python translate-srt-to-anki.py -h
   - One screenshot is extracted per subtitle at the midpoint of its time range.
   - An additional `Image` column is added to the CSV containing `<img src='FILENAME.jpg'>`.
   - Images are saved in a folder (default `images` next to the CSV, or `--media-dir` if provided).
-  - Keep the CSV and images together when importing into Anki so the importer can copy media.
+  - Keep the CSV and images together when importing into Anki so the importer can copy the media.
 - When `--video` is not provided:
   - Duplicate subtitle texts are removed to reduce repetition.
-
-### Examples
-- Minimal translation only, CSV saved as `movie.csv` alongside `movie.srt`:
-```bash
-python translate-srt-to-anki.py /path/to/movie.srt
-```
-- Explicit output path:
-```bash
-python translate-srt-to-anki.py /path/to/movie.srt /path/to/out/movie.csv
-```
-- With screenshots, images saved to `images/` alongside the CSV:
-```bash
-python translate-srt-to-anki.py /path/to/movie.srt /path/to/out/movie.csv --video /path/to/movie.mp4
-```
-- With screenshots, custom media folder:
-```bash
-python translate-srt-to-anki.py /path/to/movie.srt /path/to/out/movie.csv --video /path/to/movie.mp4 --media-dir /path/to/out/subtitle-images
-```
 
 ## CSV format
 - Columns without `--video`: `Spanish`, `English`
@@ -92,6 +105,7 @@ python translate-srt-to-anki.py /path/to/movie.srt /path/to/out/movie.csv --vide
 - **ffmpeg not found**: Install `ffmpeg` and ensure it’s on your `PATH` (see Requirements).
 - **Translation errors/rate limiting**: The `deep-translator` Google backend may occasionally throttle or fail; retry later.
 - **Garbled characters**: Ensure your `.srt` is UTF‑8 encoded. The script reads with `encoding="utf-8"`.
+- **yt-dlp not found**: Install `yt-dlp` and ensure it’s on your `PATH` if using `--yt-url`.
 
 ## Notes
 - Screenshots are taken at each subtitle’s midpoint timestamp for best context.
