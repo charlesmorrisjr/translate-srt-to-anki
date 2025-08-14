@@ -1,0 +1,6 @@
+.venv
+images
+
+*.csv
+*.srt
+*.mp4

@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""
+Convert a Spanish SRT subtitle file to an Anki-ready CSV.
+Requires: pip install deep-translator
+Usage:
+  python translate-srt-to-anki.py input.srt [output.csv]
+  python translate-srt-to-anki.py input.srt [output.csv] --video /path/to/video.mp4 [--media-dir images]
+If output is not provided, the CSV will be written next to the input with the same name and a .csv extension.
+If --video is provided, a screenshot will be extracted for each subtitle at the midpoint of its time range
+and an additional Image column will be added to the CSV with an <img src="..."> tag referencing the file.
+Place the CSV and images in the same folder when importing into Anki so the importer can copy the media.
+"""
+
+import sys
+import re
+import csv
+import argparse
+import subprocess
+from pathlib import Path
+from typing import List, Optional, Tuple
+from deep_translator import GoogleTranslator
+
+
+def parse_timestamp_to_seconds(timestamp: str) -> float:
+    match = re.match(r"^(\d{2}):(\d{2}):(\d{2}),(\d{3})$", timestamp)
+    if not match:
+        raise ValueError(f"Invalid timestamp: {timestamp}")
+    hours, minutes, seconds, millis = map(int, match.groups())
+    return hours * 3600 + minutes * 60 + seconds + millis / 1000.0
+
+
+def parse_srt_with_timing(lines: List[str]) -> List[Tuple[int, float, float, str]]:
+    """
+    Returns a list of tuples: (index, start_seconds, end_seconds, text)
+    Joins multi-line subtitle text within the same block with spaces.
+    Filters out bracketed notes-only lines within a block.
+    """
+    blocks: List[Tuple[int, float, float, str]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        # Skip empty lines
+        if not lines[i].strip():
+            i += 1
+            continue
+        # Index line
+        index_line = lines[i].strip()
+        if not re.match(r"^\d+$", index_line):
+            # Unexpected; try to continue searching
+            i += 1
+            continue
+        try:
+            idx = int(index_line)
+        except ValueError:
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            break
+        # Timestamp line
+        time_line = lines[i].strip()
+        time_match = re.match(r"^(\d{2}:\d{2}:\d{2},\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2},\d{3})", time_line)
+        if not time_match:
+            i += 1
+            continue
+        start_ts, end_ts = time_match.groups()
+        start_s = parse_timestamp_to_seconds(start_ts)
+        end_s = parse_timestamp_to_seconds(end_ts)
+        i += 1
+        # Collect text lines until blank line
+        text_lines: List[str] = []
+        while i < n and lines[i].strip():
+            line_text = lines[i].strip()
+            # Skip bracketed notes like [Música]
+            if re.match(r"^\[.*\]$", line_text):
+                i += 1
+                continue
+            text_lines.append(line_text)
+            i += 1
+        # Skip the blank line separator
+        while i < n and not lines[i].strip():
+            i += 1
+        if not text_lines:
+            continue
+        merged_text = " ".join(text_lines)
+        blocks.append((idx, start_s, end_s, merged_text))
+    return blocks
+
+
+def extract_screenshot(video_path: str, timestamp_sec: float, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Use -ss before input for fast seek and after input for accuracy
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{timestamp_sec:.3f}",
+        "-i",
+        video_path,
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        str(output_path),
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not found. Please install ffmpeg and try again.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffmpeg failed when extracting {output_path.name}") from e
+
+
+def should_filter_subtitle_text(text: str) -> bool:
+    """Return True if the subtitle text should be removed as trivial or name-only."""
+    t = text.strip()
+    if not t:
+        return True
+    lower = t.lower()
+    trivial = {
+        "ah", "ah.", "eh", "eh.", "uh", "uh.", "oh", "oh.",
+        "mm", "mm.", "mmm", "mmm.", "hmm", "hmm.", "m", "m."
+    }
+    # Remove leading dashes and trailing punctuation for checks
+    lower_stripped = re.sub(r"^[\-—–_\s]+|[\s\.,!\?…·•;:¡¿]+$", "", lower)
+    if lower in trivial or lower_stripped in trivial:
+        return True
+    # Single-letter with optional period, e.g., "M" or "M."
+    if re.match(r"^[a-záéíóúñ]\.?$", lower_stripped):
+        return True
+    # Speaker/name-only line: allow trailing punctuation like '.', '!', '?', ':'
+    caps_stripped = re.sub(r"^[\-—–_\s]+|[\s\.,!\?…·•;:¡¿]+$", "", t)
+    if re.match(r"^[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+$", caps_stripped):
+        return True
+    if re.match(r"^[A-ZÁÉÍÓÚÑ][a-záéíóúñ]+:$", t.strip()):
+        return True
+    # Very short 1-2 token interjection-like phrases
+    tokens = re.findall(r"[A-Za-zÁÉÍÓÚÑáéíóúñ]+", t)
+    if len(tokens) <= 2:
+        joined = " ".join(tok.lower() for tok in tokens)
+        if joined in trivial:
+            return True
+    return False
+
+
+def srt_to_anki_csv(input_path: str, output_path: str, video_path: Optional[str] = None, media_dir: Optional[str] = None):
+    # Read SRT file
+    with open(input_path, "r", encoding="utf-8") as f:
+        lines = f.read().splitlines()
+
+    # Parse SRT blocks with timing and merged text per block
+    blocks = parse_srt_with_timing(lines)
+
+    # Remove trivial interjections and name-only lines
+    blocks = [b for b in blocks if not should_filter_subtitle_text(b[3])]
+
+    # Remove duplicates only when not generating images (to keep image mapping stable)
+    if video_path is None:
+        seen_texts = set()
+        filtered_blocks = []
+        for idx, start_s, end_s, text in blocks:
+            if text in seen_texts:
+                continue
+            seen_texts.add(text)
+            filtered_blocks.append((idx, start_s, end_s, text))
+        blocks = filtered_blocks
+
+    # Translate
+    translator = GoogleTranslator(source="es", target="en")
+
+    # Determine media directory and filename base if video provided
+    output_csv_path = Path(output_path)
+    if video_path:
+        media_root = Path(media_dir) if media_dir else output_csv_path.with_suffix("").parent / "images"
+        # If user gave a directory path for output CSV (e.g., ./out/file.csv), ensure media folder is next to CSV
+        if not media_dir:
+            media_root = output_csv_path.parent / "images"
+        media_root.mkdir(parents=True, exist_ok=True)
+        image_rel_prefix = media_root.name  # Use relative folder name in CSV
+
+    rows: List[List[str]] = []
+    for i, (idx, start_s, end_s, es_text) in enumerate(blocks, start=1):
+        en_text = translator.translate(es_text)
+        if video_path:
+            midpoint = start_s + max(0.0, (end_s - start_s)) / 2.0
+            image_name = f"{Path(input_path).stem}-{i:04d}.jpg"
+            image_path = media_root / image_name
+            extract_screenshot(video_path, midpoint, image_path)
+            # image_field = f"<img src='{image_rel_prefix}/{image_name}'>"
+            image_field = f"<img src='{image_name}'>"
+            rows.append([es_text, en_text, image_field])
+        else:
+            rows.append([es_text, en_text])
+
+    # Write CSV
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        if video_path:
+            writer.writerow(["Spanish", "English", "Image"])
+        else:
+            writer.writerow(["Spanish", "English"])
+        writer.writerows(rows)
+
+    print(f"CSV saved to {output_path}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Convert a Spanish SRT subtitle file to an Anki-ready CSV, optionally with screenshots from a matching video.")
+    parser.add_argument("input", help="Path to input .srt file")
+    parser.add_argument("output", nargs="?", help="Path to output .csv file. Defaults to input name with .csv extension")
+    parser.add_argument("--video", dest="video", help="Path to the corresponding video file for taking screenshots")
+    parser.add_argument("--media-dir", dest="media_dir", help="Directory to save images (default: images next to CSV)")
+
+    args = parser.parse_args()
+
+    input_path = args.input
+    output_path = args.output or str(Path(input_path).with_suffix(".csv"))
+
+    srt_to_anki_csv(input_path, output_path, video_path=args.video, media_dir=args.media_dir)
